@@ -1,0 +1,9 @@
+config FESERIAL
+	tristate "Free-electrons serial uart support"
+	default n
+	---help---
+    This driver provides support for the incredible Free Electrons serial uart
+    driver.
+
+	  To compile this driver as a module, choose M here. The module
+	  will be called feserial.
