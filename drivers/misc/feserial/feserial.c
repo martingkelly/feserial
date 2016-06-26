@@ -12,9 +12,13 @@
 
 #define FESERIAL_NAME "feserial"
 
+#define SERIAL_RESET_COUNTER (0)
+#define SERIAL_GET_COUNTER (1)
+
 struct feserial_dev {
 	struct miscdevice miscdev;
 	void __iomem *regs;
+	unsigned int write_count;
 };
 
 unsigned int reg_read(struct feserial_dev *dev, int off) {
@@ -49,14 +53,37 @@ static ssize_t feserial_write(struct file *file, const char __user *buf,
 		get_user(c, &buf[i]);
 		uart_write(dev, c);
 	}
+	dev->write_count += count;
 
 	return count;
 }
 
+static long feserial_ioctl(struct file *file, unsigned int cmd,
+	unsigned long arg) {
+	struct feserial_dev *dev;
+	unsigned int __user *argp;
+
+	dev = container_of(file->private_data, struct feserial_dev, miscdev);
+	switch(cmd) {
+	case SERIAL_RESET_COUNTER:
+		dev->write_count = 0;
+		break;
+	case SERIAL_GET_COUNTER:
+		argp = (unsigned int __user *) arg;
+		put_user(dev->write_count, argp);
+		break;
+	default:
+		return -ENXIO;
+	}
+
+	return 0;
+}
+
 static const struct file_operations fops = {
-	.owner    = THIS_MODULE,
-	.read   = feserial_read,
-	.write    = feserial_write,
+	.owner = THIS_MODULE,
+	.read = feserial_read,
+	.write = feserial_write,
+	.unlocked_ioctl = feserial_ioctl
 };
 
 
@@ -67,8 +94,6 @@ static int feserial_probe(struct platform_device *pdev)
 	const char *name;
 	struct resource *res;
 	unsigned int uartclk;
-
-	pr_info("Called feserial_probe\n");
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (res == NULL) {
@@ -106,6 +131,8 @@ static int feserial_probe(struct platform_device *pdev)
 	reg_write(dev, UART_FCR_CLEAR_RCVR | UART_FCR_CLEAR_XMIT, UART_FCR);
 	reg_write(dev, 0x00, UART_OMAP_MDR1);
 
+	dev->write_count = 0;
+
 	/* Setup misc device. */
 	dev->miscdev.minor = MISC_DYNAMIC_MINOR;
 	name = kasprintf(GFP_KERNEL, FESERIAL_NAME "-%x", res->start);
@@ -119,8 +146,6 @@ static int feserial_probe(struct platform_device *pdev)
 static int feserial_remove(struct platform_device *pdev)
 {
 	struct feserial_dev *dev;
-
-	pr_info("Called feserial_remove\n");
 
 	dev = platform_get_drvdata(pdev);
 	misc_deregister(&dev->miscdev);
