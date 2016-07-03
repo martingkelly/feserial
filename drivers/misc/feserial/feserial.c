@@ -1,5 +1,6 @@
 #include <linux/fs.h>
 #include <linux/init.h>
+#include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
@@ -8,75 +9,158 @@
 #include <linux/of.h>
 #include <linux/serial_reg.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/uaccess.h>
-
-#define FESERIAL_NAME "feserial"
+#include <linux/wait.h>
 
 #define SERIAL_RESET_COUNTER (0)
 #define SERIAL_GET_COUNTER (1)
+#define SERIAL_BUFSIZE 16
 
 struct feserial_dev {
 	struct miscdevice miscdev;
 	void __iomem *regs;
 	unsigned int write_count;
+	int irq;
+	char serial_buf[SERIAL_BUFSIZE];
+	int serial_buf_rd;
+	int serial_buf_wr;
+	wait_queue_head_t wq;
+	spinlock_t lock;
 };
 
-unsigned int reg_read(struct feserial_dev *dev, int off) {
+unsigned int reg_read(struct feserial_dev *dev, int off)
+{
 	return readl(dev->regs + 4*off);
 }
 
-void reg_write(struct feserial_dev *dev, unsigned int val, int off) {
+void reg_write(struct feserial_dev *dev, unsigned int val, int off)
+{
 	writel(val, dev->regs + 4*off);
 }
 
-void uart_write(struct feserial_dev *dev, char c) {
+void uart_write(struct feserial_dev *dev, char c)
+{
 	while (!(reg_read(dev, UART_LSR) & UART_LSR_THRE))
 		cpu_relax();
 
 	reg_write(dev, c, UART_TX);
 }
 
+static irqreturn_t feserial_irq_handler(int irq, void *dev_id)
+{
+	char c;
+	struct feserial_dev *dev = dev_id;
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->lock, flags);
+
+	/* ACK the interrupt and store the received character. */
+	do {
+		c = reg_read(dev, UART_RX);
+	} while (!(reg_read(dev, UART_IIR) & UART_IIR_NO_INT));
+	dev->serial_buf[dev->serial_buf_wr] = c;
+
+	/* Update write index. */
+	dev->serial_buf_wr++;
+	if (dev->serial_buf_wr == SERIAL_BUFSIZE)
+		dev->serial_buf_wr = 0;
+
+	spin_unlock_irqrestore(&dev->lock, flags);
+
+	wake_up(&dev->wq);
+
+	return IRQ_HANDLED;
+}
 
 static ssize_t feserial_read(struct file *file, char __user *buf, size_t count,
-	loff_t *offset) {
-	return -EINVAL;
+					loff_t *offset)
+{
+	struct feserial_dev *dev;
+	int ret;
+	unsigned long flags;
+
+	dev = container_of(file->private_data, struct feserial_dev, miscdev);
+
+	spin_lock_irqsave(&dev->lock, flags);
+	if (dev->serial_buf_rd == dev->serial_buf_wr) {
+		/*
+		 * No more data available; sleep and wait. Drop the lock
+		 * first so someone can fill in the data!
+		 */
+		spin_unlock_irqrestore(&dev->lock, flags);
+		ret = wait_event_interruptible(dev->wq,
+				dev->serial_buf_rd != dev->serial_buf_wr);
+		/* Return if we were interrupted. */
+		if (ret == -ERESTARTSYS) {
+			return 0;
+		}
+		spin_lock_irqsave(&dev->lock, flags);
+	}
+	put_user(dev->serial_buf[dev->serial_buf_rd], buf);
+
+	/* Update read index. */
+	dev->serial_buf_rd++;
+	if (dev->serial_buf_rd == SERIAL_BUFSIZE)
+		dev->serial_buf_rd = 0;
+	spin_unlock_irqrestore(&dev->lock, flags);
+
+	return 1;
 }
 
 static ssize_t feserial_write(struct file *file, const char __user *buf,
-	size_t count, loff_t *offset) {
+					size_t count, loff_t *offset)
+{
 	char c;
 	struct feserial_dev *dev;
 	int i;
+	unsigned long flags;
 
 	dev = container_of(file->private_data, struct feserial_dev, miscdev);
+
+	spin_lock_irqsave(&dev->lock, flags);
+
 	for (i = 0; i < count; i++) {
 		get_user(c, &buf[i]);
 		uart_write(dev, c);
 	}
 	dev->write_count += count;
 
+	spin_unlock_irqrestore(&dev->lock, flags);
+
 	return count;
 }
 
 static long feserial_ioctl(struct file *file, unsigned int cmd,
-	unsigned long arg) {
-	struct feserial_dev *dev;
+				unsigned long arg)
+{
 	unsigned int __user *argp;
+	struct feserial_dev *dev;
+	unsigned long flags;
+	long ret;
 
 	dev = container_of(file->private_data, struct feserial_dev, miscdev);
+
+	spin_lock_irqsave(&dev->lock, flags);
+
 	switch(cmd) {
 	case SERIAL_RESET_COUNTER:
 		dev->write_count = 0;
+		ret = 0;
 		break;
 	case SERIAL_GET_COUNTER:
 		argp = (unsigned int __user *) arg;
 		put_user(dev->write_count, argp);
+		ret = 0;
 		break;
 	default:
-		return -ENXIO;
+		ret = -ENXIO;
+		break;
 	}
 
-	return 0;
+	spin_unlock_irqrestore(&dev->lock, flags);
+
+	return ret;
 }
 
 static const struct file_operations fops = {
@@ -93,6 +177,7 @@ static int feserial_probe(struct platform_device *pdev)
 	struct feserial_dev *dev;
 	const char *name;
 	struct resource *res;
+	int status;
 	unsigned int uartclk;
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
@@ -111,6 +196,25 @@ static int feserial_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "Cannot remap registers\n");
 		return PTR_ERR(dev->regs);
 	}
+	dev->write_count = 0;
+
+	dev->irq = platform_get_irq(pdev, 0);
+	if (dev->irq <= 0) {
+		dev_err(&pdev->dev, "Unable to obtain IRQ\n");
+		return -ENODEV;
+	}
+	status = devm_request_irq(&pdev->dev, dev->irq, feserial_irq_handler, 0, "feserial",
+		dev);
+	if (status < 0) {
+		dev_err(&pdev->dev, "Unable to request IRQ\n");
+		return status;
+	}
+
+	dev->serial_buf_rd = 0;
+	dev->serial_buf_wr = 0;
+
+	init_waitqueue_head(&dev->wq);
+	spin_lock_init(&dev->lock);
 
 	platform_set_drvdata(pdev, dev);
 
@@ -131,11 +235,12 @@ static int feserial_probe(struct platform_device *pdev)
 	reg_write(dev, UART_FCR_CLEAR_RCVR | UART_FCR_CLEAR_XMIT, UART_FCR);
 	reg_write(dev, 0x00, UART_OMAP_MDR1);
 
-	dev->write_count = 0;
+	/* Enable receiver data interrupts. */
+	reg_write(dev, UART_IER_RDI, UART_IER);
 
 	/* Setup misc device. */
 	dev->miscdev.minor = MISC_DYNAMIC_MINOR;
-	name = kasprintf(GFP_KERNEL, FESERIAL_NAME "-%x", res->start);
+	name = kasprintf(GFP_KERNEL, "feserial-%x", res->start);
 	dev->miscdev.name = name;
 	dev->miscdev.fops = &fops;
 	misc_register(&dev->miscdev);
@@ -165,7 +270,7 @@ MODULE_DEVICE_TABLE(of, feserial_of_match);
 
 static struct platform_driver feserial_driver = {
 	.driver = {
-		.name = FESERIAL_NAME,
+		.name = "feserial",
 		.owner = THIS_MODULE,
 		.of_match_table = feserial_of_match
 	},
