@@ -60,6 +60,7 @@ static irqreturn_t feserial_irq_handler(int irq, void *dev_id)
 		c = reg_read(dev, UART_RX);
 	} while (!(reg_read(dev, UART_IIR) & UART_IIR_NO_INT));
 	dev->serial_buf[dev->serial_buf_wr] = c;
+	pr_debug("IRQ read %c\n", c);
 
 	/* Update write index. */
 	dev->serial_buf_wr++;
@@ -99,6 +100,8 @@ static ssize_t feserial_read(struct file *file, char __user *buf, size_t count,
 	}
 	put_user(dev->serial_buf[dev->serial_buf_rd], buf);
 
+	pr_debug("read %c\n", dev->serial_buf[dev->serial_buf_rd]);
+
 	/* Update read index. */
 	dev->serial_buf_rd++;
 	if (dev->serial_buf_rd == SERIAL_BUFSIZE)
@@ -122,6 +125,7 @@ static ssize_t feserial_write(struct file *file, const char __user *buf,
 
 	for (i = 0; i < count; i++) {
 		get_user(c, &buf[i]);
+		pr_debug("wrote %c\n", c);
 		uart_write(dev, c);
 	}
 	dev->write_count += count;
