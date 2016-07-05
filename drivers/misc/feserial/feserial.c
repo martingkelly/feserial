@@ -1,3 +1,4 @@
+#include <linux/debugfs.h>
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
@@ -20,11 +21,12 @@
 struct feserial_dev {
 	struct miscdevice miscdev;
 	void __iomem *regs;
-	unsigned int write_count;
+	u32 write_count;
 	int irq;
 	char serial_buf[SERIAL_BUFSIZE];
 	int serial_buf_rd;
 	int serial_buf_wr;
+	struct dentry *debugfs_parent;
 	wait_queue_head_t wq;
 	spinlock_t lock;
 };
@@ -184,6 +186,8 @@ static int feserial_probe(struct platform_device *pdev)
 	int status;
 	unsigned int uartclk;
 
+	/* TODO: Cleanup everything properly in the failure cases. */
+
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (res == NULL) {
 		pr_err("Cannot get resource\n");
@@ -249,6 +253,12 @@ static int feserial_probe(struct platform_device *pdev)
 	dev->miscdev.fops = &fops;
 	misc_register(&dev->miscdev);
 
+	dev->debugfs_parent = debugfs_create_dir(name, NULL);
+	if (dev->debugfs_parent == NULL)
+		return -ENOMEM;
+	debugfs_create_u32("write_count", S_IRUGO, dev->debugfs_parent,
+							&dev->write_count);
+
 	return 0;
 }
 
@@ -257,6 +267,7 @@ static int feserial_remove(struct platform_device *pdev)
 	struct feserial_dev *dev;
 
 	dev = platform_get_drvdata(pdev);
+	debugfs_remove_recursive(dev->debugfs_parent);
 	misc_deregister(&dev->miscdev);
 	kfree(dev->miscdev.name);
 	pm_runtime_disable(&pdev->dev);
