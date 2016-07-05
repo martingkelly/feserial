@@ -181,12 +181,10 @@ static int feserial_probe(struct platform_device *pdev)
 {
 	unsigned int baud_divisor;
 	struct feserial_dev *dev;
-	const char *name;
+	struct dentry *file;
 	struct resource *res;
 	int status;
 	unsigned int uartclk;
-
-	/* TODO: Cleanup everything properly in the failure cases. */
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (res == NULL) {
@@ -199,12 +197,12 @@ static int feserial_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "Cannot allocate dev\n");
 		return -ENOMEM;
 	}
+
 	dev->regs = devm_ioremap_resource(&pdev->dev, res);
 	if (IS_ERR(dev->regs)) {
 		dev_err(&pdev->dev, "Cannot remap registers\n");
 		return PTR_ERR(dev->regs);
 	}
-	dev->write_count = 0;
 
 	dev->irq = platform_get_irq(pdev, 0);
 	if (dev->irq <= 0) {
@@ -218,9 +216,9 @@ static int feserial_probe(struct platform_device *pdev)
 		return status;
 	}
 
+	dev->write_count = 0;
 	dev->serial_buf_rd = 0;
 	dev->serial_buf_wr = 0;
-
 	init_waitqueue_head(&dev->wq);
 	spin_lock_init(&dev->lock);
 
@@ -239,37 +237,60 @@ static int feserial_probe(struct platform_device *pdev)
 	reg_write(dev, (baud_divisor >> 8) & 0xff, UART_DLM);
 	reg_write(dev, UART_LCR_WLEN8, UART_LCR);
 
+	/* Enable receiver data interrupts. */
+	reg_write(dev, UART_IER_RDI, UART_IER);
+
 	/* Soft reset */
 	reg_write(dev, UART_FCR_CLEAR_RCVR | UART_FCR_CLEAR_XMIT, UART_FCR);
 	reg_write(dev, 0x00, UART_OMAP_MDR1);
 
-	/* Enable receiver data interrupts. */
-	reg_write(dev, UART_IER_RDI, UART_IER);
-
 	/* Setup misc device. */
 	dev->miscdev.minor = MISC_DYNAMIC_MINOR;
-	name = kasprintf(GFP_KERNEL, "feserial-%x", res->start);
-	dev->miscdev.name = name;
-	dev->miscdev.fops = &fops;
-	misc_register(&dev->miscdev);
+	dev->miscdev.name = kasprintf(GFP_KERNEL, "feserial-%x", res->start);
+	if (dev->miscdev.name == NULL) {
+		status = -ENOMEM;
+		goto error_pm_runtime;
+	}
 
-	dev->debugfs_parent = debugfs_create_dir(name, NULL);
-	if (dev->debugfs_parent == NULL)
-		return -ENOMEM;
-	debugfs_create_u32("write_count", S_IRUGO, dev->debugfs_parent,
+	dev->miscdev.fops = &fops;
+	status = misc_register(&dev->miscdev);
+	if (status < 0) {
+		goto error_miscdev_name;
+	}
+
+	/* Setup debugfs entries. */
+	dev->debugfs_parent = debugfs_create_dir(dev->miscdev.name, NULL);
+	if (dev->debugfs_parent == NULL) {
+		status = -ENOMEM;
+		goto error_misc_register;
+	}
+	file = debugfs_create_u32("write_count", S_IRUGO, dev->debugfs_parent,
 							&dev->write_count);
+	if (file == NULL) {
+		status = -ENOMEM;
+		goto error_debugfs;
+	}
 
 	return 0;
+
+error_debugfs:
+	debugfs_remove_recursive(dev->debugfs_parent);
+error_misc_register:
+	misc_deregister(&dev->miscdev);
+error_miscdev_name:
+	kfree(dev->miscdev.name);
+error_pm_runtime:
+	pm_runtime_disable(&pdev->dev);
+	return status;
 }
 
 static int feserial_remove(struct platform_device *pdev)
 {
-	struct feserial_dev *dev;
+	struct feserial_dev *dev = platform_get_drvdata(pdev);
 
-	dev = platform_get_drvdata(pdev);
-	debugfs_remove_recursive(dev->debugfs_parent);
 	misc_deregister(&dev->miscdev);
 	kfree(dev->miscdev.name);
+	debugfs_remove_recursive(dev->debugfs_parent);
 	pm_runtime_disable(&pdev->dev);
 
 	return 0;
